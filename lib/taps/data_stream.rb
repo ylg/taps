@@ -231,7 +231,7 @@ class DataStreamKeyed < DataStream
 		num = 0
 		loop do
 			limit = (chunksize * 1.1).ceil - num
-			ds = table.order(*order_by).filter(primary_key > buffer_limit).limit(limit)
+			ds = table.order(*order_by).filter(limit > buffer_limit).limit(limit)
 			log.debug "DataStreamKeyed#load_buffer SQL -> #{ds.sql}"
 			data = ds.all
 			self.buffer += data
