@@ -28,6 +28,10 @@ class Operation
 		"op"
 	end
 
+	def log
+		Taps.log
+	end
+
 	def store_session
 		file = "#{file_prefix}_#{Time.now.strftime("%Y%m%d%H%M")}.dat"
 		puts "Saving session to #{file}.."
@@ -40,6 +44,7 @@ class Operation
 		{
 			:klass => self.class.to_s,
 			:database_url => database_url,
+			:remote_url => remote_url,
 			:session_uri => session_uri,
 			:stream_state => stream_state,
 			:completed_tables => completed_tables,
@@ -62,6 +67,10 @@ class Operation
 		}
 	end
 
+	def resuming?
+		opts[:resume] == true
+	end
+
 	def default_chunksize
 		opts[:default_chunksize]
 	end
@@ -76,6 +85,10 @@ class Operation
 
 	def stream_state=(val)
 		opts[:stream_state] = val
+	end
+
+	def compression_disabled?
+		!!opts[:disable_compression]
 	end
 
 	def db
@@ -115,7 +128,13 @@ class Operation
 	end
 
 	def http_headers(extra = {})
-		{ :taps_version => Taps.compatible_version }.merge(extra)
+		base = { :taps_version => Taps.compatible_version }
+		if compression_disabled?
+			base[:accept_encoding] = ""
+		else
+			base[:accept_encoding] = "gzip, deflate"
+		end
+		base.merge(extra)
 	end
 
 	def format_number(num)
@@ -128,7 +147,7 @@ class Operation
 		rescue RestClient::RequestFailed => e
 			if e.http_code == 417
 				puts "#{safe_remote_url} is running a different minor version of taps."
-				puts "#{e.response.body}"
+				puts "#{e.response.to_s}"
 				exit(1)
 			else
 				raise
@@ -143,47 +162,19 @@ class Operation
 	end
 
 	def self.factory(type, database_url, remote_url, opts)
+		type = :resume if opts[:resume]
 		klass = case type
 			when :pull then Taps::Pull
 			when :push then Taps::Push
+			when :resume then eval(opts[:klass])
 			else raise "Unknown Operation Type -> #{type}"
 		end
 
 		klass.new(database_url, remote_url, opts)
 	end
-
-	def self.resume(remote_url, session)
-		klass = session[:klass]
-		eval(klass).new(session[:database_url], remote_url, session).resume
-	end
 end
 
 class Pull < Operation
-	def resume
-		begin
-			verify_server
-
-			setup_signal_trap
-
-			pull_partial_data
-
-			pull_data
-			pull_indexes
-			pull_reset_sequences
-			close_session
-		rescue RestClient::Exception => e
-			if e.respond_to?(:response)
-				puts "!!! Caught Server Exception"
-				puts "HTTP CODE: #{e.http_code}"
-				puts "#{e.response}"
-				puts "#{e.backtrace}"
-				exit(1)
-			else
-				raise
-			end
-		end
-	end
-
 	def file_prefix
 		"pull"
 	end
@@ -195,9 +186,12 @@ class Pull < Operation
 	def run
 		begin
 			verify_server
-			pull_schema
+
+			pull_schema unless resuming?
 
 			setup_signal_trap
+
+			pull_partial_data if resuming?
 
 			pull_data
 			pull_indexes
@@ -207,7 +201,7 @@ class Pull < Operation
 			if e.respond_to?(:response)
 				puts "!!! Caught Server Exception"
 				puts "HTTP CODE: #{e.http_code}"
-				puts "#{e.response}"
+				puts "#{e.response.to_s}"
 				exit(1)
 			else
 				raise
@@ -218,7 +212,7 @@ class Pull < Operation
 	def pull_schema
 		puts "Receiving schema"
 
-		schema_data = session_resource['pull/schema'].get(http_headers).body.to_s
+		schema_data = session_resource['pull/schema'].get(http_headers).to_s
 		output = Taps::Utils.load_schema(database_url, schema_data)
 		puts output if output
 	end
@@ -294,7 +288,7 @@ class Pull < Operation
 		retries = 0
 		max_retries = 1
 		begin
-			tables_with_counts = Marshal.load(session_resource['pull/tables'].get(http_headers).body.to_s)
+			tables_with_counts = Marshal.load(session_resource['pull/tables'].get(http_headers).to_s)
 		rescue RestClient::Exception
 			retries += 1
 			retry if retries <= max_retries
@@ -308,7 +302,7 @@ class Pull < Operation
 	def pull_schema
 		puts "Receiving schema"
 
-		schema_data = session_resource['pull/schema'].get(http_headers).body.to_s
+		schema_data = session_resource['pull/schema'].get(http_headers).to_s
 		output = Taps::Utils.load_schema(database_url, schema_data)
 		puts output if output
 	end
@@ -316,7 +310,7 @@ class Pull < Operation
 	def pull_indexes
 		puts "Receiving indexes"
 
-		index_data = session_resource['pull/indexes'].get(http_headers).body.to_s
+		index_data = session_resource['pull/indexes'].get(http_headers).to_s
 
 		output = Taps::Utils.load_indexes(database_url, index_data)
 		puts output if output
@@ -331,31 +325,6 @@ class Pull < Operation
 end
 
 class Push < Operation
-	def resume
-		begin
-			verify_server
-
-			setup_signal_trap
-
-			push_partial_data
-
-			push_data
-			push_indexes
-			push_reset_sequences
-
-		rescue RestClient::Exception => e
-			if e.respond_to?(:response)
-				puts "!!! Caught Server Exception"
-				puts "HTTP CODE: #{e.http_code}"
-				puts "#{e.response.body}"
-				exit(1)
-			else
-				raise
-			end
-		end
-
-	end
-
 	def file_prefix
 		"push"
 	end
@@ -367,8 +336,12 @@ class Push < Operation
 	def run
 		begin
 			verify_server
+			push_schema unless resuming?
+
 			setup_signal_trap
-			push_schema
+
+			push_partial_data if resuming?
+
 			push_data
 			push_indexes
 			push_reset_sequences
@@ -377,7 +350,7 @@ class Push < Operation
 			if e.respond_to?(:response)
 				puts "!!! Caught Server Exception"
 				puts "HTTP CODE: #{e.http_code}"
-				puts "#{e.response.body}"
+				puts "#{e.response.to_s}"
 				exit(1)
 			else
 				raise
@@ -439,18 +412,18 @@ class Push < Operation
 			chunksize = stream.state[:chunksize]
 			chunksize = Taps::Utils.calculate_chunksize(chunksize) do |c|
 				stream.state[:chunksize] = c
-				gzip_data, row_size, elapsed_time = stream.fetch
+				encoded_data, row_size, elapsed_time = stream.fetch
 				break if stream.complete?
 
 				data = {
 					:state => stream.to_hash,
-					:checksum => Taps::Utils.checksum(gzip_data).to_s
+					:checksum => Taps::Utils.checksum(encoded_data).to_s
 				}
 
 				begin
 					content, content_type = Taps::Multipart.create do |r|
-						r.attach :name => :gzip_data,
-							:payload => gzip_data,
+						r.attach :name => :encoded_data,
+							:payload => encoded_data,
 							:content_type => 'application/octet-stream'
 						r.attach :name => :json,
 							:payload => data.to_json,
@@ -467,6 +440,7 @@ class Push < Operation
 				end
 				elapsed_time
 			end
+			stream.state[:chunksize] = chunksize
 
 			progress.inc(row_size)
 
